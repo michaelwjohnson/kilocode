@@ -1,4 +1,4 @@
-import { lstat } from "fs/promises" // kilocode_change
+import { lstat, open } from "fs/promises" // kilocode_change
 import { Effect, Option, Schema, Scope } from "effect"
 import { NonNegativeInt } from "@/util/schema"
 import { createReadStream } from "fs"
@@ -356,10 +356,24 @@ export const ReadTool = Tool.define(
 
 // kilocode_change start
 export async function lines(filepath: string, opts: { limit: number; offset: number }) {
-  // kilocode_change end
-  // kilocode_change start - decode with detected encoding; replaces createReadStream(filepath, { encoding: "utf8" })
-  const encoded = await Encoding.read(filepath)
-  const stream = Readable.from([encoded.text])
+  // Sniff encoding from a small sample so we can stream the common UTF-8 case
+  // straight from disk and bail out early once the limit / byte cap is hit.
+  // Only fall back to a full-buffer decode for legacy or wide encodings, where
+  // streaming line-by-line through iconv-lite is not worth the added moving parts.
+  const fh = await open(filepath, "r")
+  let encoding: string
+  try {
+    const probe = Buffer.alloc(SAMPLE_BYTES)
+    const { bytesRead } = await fh.read(probe, 0, SAMPLE_BYTES, 0)
+    encoding = Encoding.detect(probe.subarray(0, bytesRead))
+  } finally {
+    await fh.close()
+  }
+
+  const stream =
+    encoding === Encoding.DEFAULT || encoding === Encoding.UTF8_BOM
+      ? createReadStream(filepath, { encoding: "utf8" })
+      : Readable.from([(await Encoding.read(filepath)).text])
   // kilocode_change end
   const rl = createInterface({
     input: stream,
@@ -375,7 +389,11 @@ export async function lines(filepath: string, opts: { limit: number; offset: num
   let cut = false
   let more = false
   try {
-    for await (const text of rl) {
+    for await (const raw_line of rl) {
+      // Strip a leading U+FEFF on the first line. iconv-lite's UTF codecs strip
+      // BOMs on decode, but createReadStream({ encoding: "utf8" }) does not, so
+      // both code paths above end up returning the same text.
+      const text = count === 0 && raw_line.charCodeAt(0) === 0xfeff ? raw_line.slice(1) : raw_line
       count += 1
       if (count <= start) continue
 
